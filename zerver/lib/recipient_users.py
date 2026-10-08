@@ -1,0 +1,108 @@
+from collections.abc import Sequence
+
+from django.core.exceptions import ValidationError
+from django.utils.translation import gettext as _
+
+from zerver.lib.exceptions import JsonableError
+from zerver.lib.users import has_inaccessible_users
+from zerver.models import DirectMessageGroup, Recipient, UserProfile
+from zerver.models.recipients import (
+    get_direct_message_group_hash,
+    get_or_create_direct_message_group,
+)
+from zerver.models.users import is_cross_realm_bot_email
+
+
+def get_recipient_from_user_profiles(
+    recipient_profiles: Sequence[UserProfile],
+    forwarder_user_profile: UserProfile | None,
+    sender: UserProfile,
+    create: bool = True,
+    forged: bool = False,
+) -> Recipient:
+    # Avoid mutating the passed in list of recipient_profiles.
+    recipient_user_ids = {user_profile.id for user_profile in recipient_profiles}
+
+    forger = forwarder_user_profile
+    impersonating = forger is not None and forger.id != sender.id
+    if impersonating and not (forged or (forger is not None and forger.id in recipient_user_ids)):
+        # Impersonating another user as the sender requires the
+        # can_forge_sender permission, and is only allowed within a
+        # conversation the forger belongs to, or when the `forged` flag
+        # is set.
+        raise ValidationError(_("User not authorized for this query"))
+
+    # Make sure the sender is included in the group direct message.
+    recipient_user_ids.add(sender.id)
+    user_ids = list(recipient_user_ids)
+
+    if create:
+        direct_message_group = get_or_create_direct_message_group(user_ids)
+    else:
+        # We intentionally let the DirectMessageGroup.DoesNotExist escape,
+        # in the case that there is no such direct message group, and the
+        # user passed create=False
+        direct_message_group = DirectMessageGroup.objects.get(
+            huddle_hash=get_direct_message_group_hash(user_ids)
+        )
+    return Recipient(
+        id=direct_message_group.recipient_id,
+        type=Recipient.DIRECT_MESSAGE_GROUP,
+        type_id=direct_message_group.id,
+    )
+
+
+def validate_recipient_user_profiles(
+    user_profiles: Sequence[UserProfile], sender: UserProfile, allow_deactivated: bool = False
+) -> Sequence[UserProfile]:
+    recipient_profiles_map: dict[int, UserProfile] = {}
+
+    # We exempt cross-realm bots from the check that all the recipients
+    # are in the same realm.
+    realms = set()
+    if not is_cross_realm_bot_email(sender.email):
+        realms.add(sender.realm_id)
+
+    for user_profile in user_profiles:
+        if (
+            not user_profile.is_active
+            and not user_profile.is_mirror_dummy
+            and not allow_deactivated
+        ) or user_profile.realm.deactivated:
+            raise ValidationError(
+                _("'{email}' is no longer using Zulip.").format(email=user_profile.email)
+            )
+        recipient_profiles_map[user_profile.id] = user_profile
+        if not is_cross_realm_bot_email(user_profile.email):
+            realms.add(user_profile.realm_id)
+
+    if len(realms) > 1:
+        raise ValidationError(_("You can't send direct messages outside of your organization."))
+
+    return list(recipient_profiles_map.values())
+
+
+def recipient_for_user_profiles(
+    user_profiles: Sequence[UserProfile],
+    forwarder_user_profile: UserProfile | None,
+    sender: UserProfile,
+    *,
+    allow_deactivated: bool = False,
+    create: bool = True,
+    forged: bool = False,
+) -> Recipient:
+    recipient_profiles = validate_recipient_user_profiles(
+        user_profiles, sender, allow_deactivated=allow_deactivated
+    )
+
+    return get_recipient_from_user_profiles(
+        recipient_profiles, forwarder_user_profile, sender, create=create, forged=forged
+    )
+
+
+def check_sender_can_access_recipients(
+    sender: UserProfile, user_profiles: Sequence[UserProfile]
+) -> None:
+    recipient_user_ids = [user.id for user in user_profiles]
+    if has_inaccessible_users(recipient_user_ids, sender):
+        raise JsonableError(_("You do not have permission to access some of the recipients."))
